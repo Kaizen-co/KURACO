@@ -1,0 +1,1957 @@
+kuraco/
+├── wrangler.toml                  # Cloudflare D1 & R2 bindings
+├── package.json
+├── astro.config.mjs               # Cloudflare adapter + SSR output
+├── tailwind.config.mjs            # Bebas Neue + Inter + Luxury Monochrome palette
+├── db/
+│   └── schema.sql                 # Complete D1 SQLite schema
+└── src/
+    ├── middleware.ts              # Hostname routing, Admin Auth guard, Rate limiting, Security headers
+    ├── lib/
+    │   ├── auth.ts                # Web Crypto PBKDF2/scrypt password hashing & HMAC session cookies
+    │   ├── db.ts                  # Typed D1 helpers
+    │   └── r2.ts                  # R2 image upload & public serving
+    ├── components/
+    │   ├── ui/                    # shadcn/ui primitives (Button, Input, Dialog, Badge, etc.)
+    │   ├── storefront/
+    │   │   ├── Navbar.astro
+    │   │   ├── RunwayLookbook.tsx # Interactive Runway 3D depth carousel + 3-item bundle selector
+    │   │   ├── ProductCard.astro
+    │   │   └── CartDrawer.tsx
+    │   └── admin/
+    │       ├── AdminLayout.astro
+    │       └── ImageUploader.tsx
+    ├── pages/
+    │   ├── index.astro            # Home: Banner, Runway Shop The Look, 8 Best Products, Bundles, Reviews
+    │   ├── shop.astro             # Catalog + Category Filter
+    │   ├── product/[slug].astro   # Product Detail + Bundle "Buy 2 Get 1" + Product Reviews
+    │   ├── cart.astro             # Cart Page
+    │   ├── checkout.astro         # Cash on Delivery Checkout
+    │   ├── media/[...key].ts      # Serves R2 images cleanly
+    │   ├── api/
+    │   │   ├── orders.ts          # Public POST (create COD order) - NO GET allowed
+    │   │   ├── auth/
+    │   │   │   ├── setup.ts       # First-time admin setup (locks permanently after 1st admin)
+    │   │   │   ├── login.ts       # Rate-limited login (5 attempts -> 15m lockout)
+    │   │   │   ├── logout.ts
+    │   │   │   └── change-password.ts
+    │   │   └── admin/             # ALL protected by middleware session verification
+    │   │       ├── upload.ts
+    │   │       ├── products.ts
+    │   │       ├── banners.ts
+    │   │       ├── bundles.ts
+    │   │       ├── runway.ts
+    │   │       ├── reviews.ts
+    │   │       ├── orders.ts
+    │   │       ├── customers.ts
+    │   │       └── settings.ts
+    │   └── kuracoadmin10/          # Hidden Admin Panel (also accessible via kuracoadmin10.kuraco.shop)
+    │       ├── setup.astro
+    │       ├── login.astro
+    │       ├── index.astro        # Dashboard (Revenue, Orders, Customers, Low Stock)
+    │       ├── products.astro
+    │       ├── runway.astro       # Runway LOOK 01/02/03 manager
+    │       ├── banners.astro
+    │       ├── bundles.astro
+    │       ├── reviews.astro
+    │       ├── orders.astro
+    │       ├── customers.astro
+    │       └── settings.astro
+name = "kuraco"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = "./dist"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kuraco-db"
+database_id = "YOUR_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "kuraco-media"
+import { defineConfig } from 'astro/config';
+import cloudflare from '@astrojs/cloudflare';
+import react from '@astrojs/react';
+import tailwind from '@astrojs/tailwind';
+
+export default defineConfig({
+  output: 'server',
+  adapter: cloudflare({
+    platformProxy: { enabled: true },
+  }),
+  integrations: [react(), tailwind({ applyBaseStyles: false })],
+});
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: ['./src/**/*.{astro,html,js,jsx,ts,tsx}'],
+  theme: {
+    extend: {
+      colors: {
+        kuraco: {
+          black: '#0A0A0A',
+          white: '#FFFFFF',
+          offwhite: '#F5F3EF',
+          border: '#E2DFD9',
+          muted: '#6E6B65',
+        },
+      },
+      fontFamily: {
+        display: ['"Bebas Neue"', 'sans-serif'],
+        sans: ['"Inter"', 'sans-serif'],
+      },
+    },
+  },
+  plugins: [],
+};
+-- 1. Admin Auth & Rate Limiting (Zero hardcoded credentials)
+CREATE TABLE IF NOT EXISTS admins (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS login_attempts (
+  ip TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  locked_until INTEGER DEFAULT NULL
+);
+
+-- 2. Store Customisation & Settings
+CREATE TABLE IF NOT EXISTS store_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  store_name TEXT NOT NULL DEFAULT 'KURACO',
+  logo_url TEXT DEFAULT '',
+  whatsapp_number TEXT DEFAULT '',
+  instagram_url TEXT DEFAULT '',
+  announcement_text TEXT DEFAULT 'FREE SHIPPING ON ALL ORDERS',
+  announcement_active INTEGER NOT NULL DEFAULT 1,
+  theme_mode TEXT NOT NULL DEFAULT 'offwhite', -- 'black' | 'white' | 'offwhite'
+  section_banner INTEGER NOT NULL DEFAULT 1,
+  section_runway INTEGER NOT NULL DEFAULT 1,
+  section_best_products INTEGER NOT NULL DEFAULT 1,
+  section_bundles INTEGER NOT NULL DEFAULT 1,
+  section_reviews INTEGER NOT NULL DEFAULT 1
+);
+
+INSERT OR IGNORE INTO store_settings (id) VALUES (1);
+
+-- 3. Home Banner
+CREATE TABLE IF NOT EXISTS banners (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  image_url TEXT NOT NULL DEFAULT '',
+  heading TEXT NOT NULL DEFAULT 'NEW DROP',
+  subtext TEXT NOT NULL DEFAULT 'ARCHITECTURAL SILHOUETTES FOR THE MODERN WARDROBE',
+  button_text TEXT NOT NULL DEFAULT 'SHOP NOW',
+  button_link TEXT NOT NULL DEFAULT '/shop'
+);
+
+INSERT OR IGNORE INTO banners (id) VALUES (1);
+
+-- 4. Products
+CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  price INTEGER NOT NULL,
+  old_price INTEGER DEFAULT NULL,
+  category TEXT NOT NULL, -- 'Shirts', 'Pants', 'Shoes', 'Outerwear', etc.
+  sizes TEXT NOT NULL DEFAULT '["S","M","L","XL"]',
+  images TEXT NOT NULL DEFAULT '[]',
+  stock INTEGER NOT NULL DEFAULT 0,
+  description TEXT DEFAULT '',
+  is_active INTEGER NOT NULL DEFAULT 1,
+  is_featured INTEGER NOT NULL DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5. Bundles (e.g., Buy 2 T-Shirts for Rs 999 / Buy 2 Get 1)
+CREATE TABLE IF NOT EXISTS bundles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  badge_text TEXT DEFAULT 'BUNDLE OFFER',
+  bundle_type TEXT NOT NULL DEFAULT 'FIXED_PRICE', -- 'FIXED_PRICE' | 'BUY_2_GET_1'
+  bundle_price INTEGER DEFAULT NULL,
+  min_items INTEGER NOT NULL DEFAULT 2,
+  product_ids TEXT NOT NULL DEFAULT '[]', -- JSON array of product IDs
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 6. Runway / Shop The Look (Model + 3 linked products: Shirt, Pant, Shoes)
+CREATE TABLE IF NOT EXISTS runway_looks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  look_name TEXT NOT NULL, -- e.g., 'LOOK 01 - STREET NIGHT'
+  model_image_url TEXT NOT NULL,
+  shirt_product_id INTEGER NOT NULL,
+  pant_product_id INTEGER NOT NULL,
+  shoes_product_id INTEGER NOT NULL,
+  full_look_price INTEGER NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (shirt_product_id) REFERENCES products(id),
+  FOREIGN KEY (pant_product_id) REFERENCES products(id),
+  FOREIGN KEY (shoes_product_id) REFERENCES products(id)
+);
+
+-- 7. Reviews (Only Approved shown publicly)
+CREATE TABLE IF NOT EXISTS reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER DEFAULT NULL,
+  customer_name TEXT NOT NULL,
+  rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  review_text TEXT NOT NULL,
+  photo_url TEXT DEFAULT '',
+  is_approved INTEGER NOT NULL DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 8. Private Customers & Orders (NEVER exposed on public APIs)
+CREATE TABLE IF NOT EXISTS customers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  phone TEXT UNIQUE NOT NULL,
+  address TEXT NOT NULL,
+  pincode TEXT NOT NULL,
+  total_orders INTEGER NOT NULL DEFAULT 0,
+  total_spent INTEGER NOT NULL DEFAULT 0,
+  is_blocked INTEGER NOT NULL DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_number TEXT UNIQUE NOT NULL,
+  customer_id INTEGER NOT NULL,
+  customer_name TEXT NOT NULL,
+  customer_phone TEXT NOT NULL,
+  shipping_address TEXT NOT NULL,
+  pincode TEXT NOT NULL,
+  items_json TEXT NOT NULL,
+  subtotal INTEGER NOT NULL,
+  discount INTEGER NOT NULL DEFAULT 0,
+  total INTEGER NOT NULL,
+  payment_method TEXT NOT NULL DEFAULT 'COD',
+  status TEXT NOT NULL DEFAULT 'New', -- 'New' | 'Packed' | 'Shipped' | 'Delivered' | 'Cancelled'
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+const ITERATIONS = 100_000;
+const KEY_LEN = 64;
+
+function toHex(buf: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function fromHex(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+export async function hashPassword(password: string): Promise<{ hash: string; salt: string }> {
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const derived = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: saltBytes, iterations: ITERATIONS, hash: 'SHA-512' },
+    keyMaterial,
+    KEY_LEN * 8
+  );
+  return { hash: toHex(derived), salt: toHex(saltBytes.buffer) };
+}
+
+export async function verifyPassword(password: string, storedHash: string, storedSalt: string): Promise<boolean> {
+  const saltBytes = fromHex(storedSalt);
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const derived = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: saltBytes, iterations: ITERATIONS, hash: 'SHA-512' },
+    keyMaterial,
+    KEY_LEN * 8
+  );
+  const candidate = toHex(derived);
+  if (candidate.length !== storedHash.length) return false;
+  let diff = 0;
+  for (let i = 0; i < candidate.length; i++) {
+    diff |= candidate.charCodeAt(i) ^ storedHash.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+export async function signSession(adminId: number, secret: string): Promise<string> {
+  const exp = Date.now() + 1000 * 60 * 60 * 24 * 7; // 7 days
+  const payload = `${adminId}.${exp}`;
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(payload));
+  return `${payload}.${toHex(sig)}`;
+}
+
+export async function verifySession(token: string | undefined, secret: string): Promise<number | null> {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [adminIdStr, expStr, sigHex] = parts;
+  if (Date.now() > Number(expStr)) return null;
+
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+  const valid = await crypto.subtle.verify('HMAC', key, fromHex(sigHex), enc.encode(`${adminIdStr}.${expStr}`));
+  return valid ? Number(adminIdStr) : null;
+}
+                      import { defineMiddleware } from 'astro:middleware';
+import { verifySession } from './lib/auth';
+
+export const onRequest = defineMiddleware(async (context, next) => {
+  const url = new URL(context.request.url);
+  const host = url.hostname;
+  const isAdminSubdomain = host.startsWith('kuracoadmin10.');
+  const isAdminPath = url.pathname.startsWith('/kuracoadmin10') || url.pathname.startsWith('/api/admin');
+
+  // Rewrite kuracoadmin10.kuraco.shop/* -> /kuracoadmin10/* seamlessly
+  if (isAdminSubdomain && !url.pathname.startsWith('/kuracoadmin10') && !url.pathname.startsWith('/api') && !url.pathname.startsWith('/media') && !url.pathname.startsWith('/_astro')) {
+    const target = new URL(`/kuracoadmin10${url.pathname === '/' ? '' : url.pathname}`, url.origin);
+    return context.rewrite(target);
+  }
+
+  if (isAdminSubdomain || isAdminPath) {
+    const db = context.locals.runtime.env.DB;
+    const secret = context.locals.runtime.env.SESSION_SECRET || 'kuraco-runtime-signing-key-change-in-cf';
+
+    const adminCountRow = await db.prepare('SELECT COUNT(*) as count FROM admins').first<{ count: number }>();
+    const hasAdmin = (adminCountRow?.count ?? 0) > 0;
+
+    const isSetupRoute = url.pathname === '/kuracoadmin10/setup' || url.pathname === '/api/auth/setup';
+    const isLoginRoute = url.pathname === '/kuracoadmin10/login' || url.pathname === '/api/auth/login';
+
+    // 1. No admin exists yet -> force Setup page
+    if (!hasAdmin && !isSetupRoute) {
+      if (url.pathname.startsWith('/api/')) {
+        return new Response(JSON.stringify({ error: 'Setup required' }), { status: 403 });
+      }
+      return context.redirect('/kuracoadmin10/setup');
+    }
+
+    // 2. Admin already exists -> permanently lock Setup page
+    if (hasAdmin && isSetupRoute) {
+      if (url.pathname.startsWith('/api/')) {
+        return new Response(JSON.stringify({ error: 'Setup permanently locked' }), { status: 403 });
+      }
+      return context.redirect('/kuracoadmin10/login');
+    }
+
+    // 3. Verify httpOnly session cookie for all protected admin pages & APIs
+    if (!isSetupRoute && !isLoginRoute) {
+      const cookie = context.cookies.get('kuraco_admin_session')?.value;
+      const adminId = await verifySession(cookie, secret);
+      if (!adminId) {
+        if (url.pathname.startsWith('/api/')) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
+        }
+        return context.redirect('/kuracoadmin10/login');
+      }
+      context.locals.adminId = adminId;
+    }
+
+    const response = await next();
+    response.headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    response.headers.set('Cache-Control', 'no-store');
+    return response;
+  }
+
+  return next();
+});
+      import type { APIRoute } from 'astro';
+import { hashPassword, signSession } from '../../../lib/auth';
+
+export const POST: APIRoute = async ({ request, locals, cookies }) => {
+  const db = locals.runtime.env.DB;
+  const secret = locals.runtime.env.SESSION_SECRET || 'kuraco-runtime-signing-key-change-in-cf';
+
+  // Double-check DB lock so race conditions can never create a second admin
+  const existing = await db.prepare('SELECT COUNT(*) as count FROM admins').first<{ count: number }>();
+  if ((existing?.count ?? 0) > 0) {
+    return new Response(JSON.stringify({ error: 'Admin setup is permanently disabled.' }), { status: 403 });
+  }
+
+  const { email, password, confirmPassword } = await request.json();
+  if (!email || !password || password.length < 8) {
+    return new Response(JSON.stringify({ error: 'Valid email and password (min 8 chars) required.' }), { status: 400 });
+  }
+  if (password !== confirmPassword) {
+    return new Response(JSON.stringify({ error: 'Passwords do not match.' }), { status: 400 });
+  }
+
+  const { hash, salt } = await hashPassword(password);
+  const res = await db
+    .prepare('INSERT INTO admins (email, password_hash, salt) VALUES (?, ?, ?)')
+    .bind(email.trim().toLowerCase(), hash, salt)
+    .run();
+
+  const token = await signSession(Number(res.meta.last_row_id), secret);
+  cookies.set('kuraco_admin_session', token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'strict',
+    path: '/',
+    maxAge: 60 * 60 * 24 * 7,
+  });
+
+  return new Response(JSON.stringify({ ok: true }), { status: 200 });
+};
+    import type { APIRoute } from 'astro';
+import { verifyPassword, signSession } from '../../../lib/auth';
+
+export const POST: APIRoute = async ({ request, locals, cookies, clientAddress }) => {
+  const db = locals.runtime.env.DB;
+  const secret = locals.runtime.env.SESSION_SECRET || 'kuraco-runtime-signing-key-change-in-cf';
+  const ip = request.headers.get('CF-Connecting-IP') || clientAddress || 'unknown';
+  const now = Date.now();
+
+  const record = await db
+    .prepare('SELECT attempts, locked_until FROM login_attempts WHERE ip = ?')
+    .bind(ip)
+    .first<{ attempts: number; locked_until: number | null }>();
+
+  if (record?.locked_until && now < record.locked_until) {
+    const minsLeft = Math.ceil((record.locked_until - now) / 60000);
+    return new Response(
+      JSON.stringify({ error: `Too many failed attempts. Try again in ${minsLeft} minute(s).` }),
+      { status: 429 }
+    );
+  }
+
+  const { email, password } = await request.json();
+  const admin = await db
+    .prepare('SELECT id, password_hash, salt FROM admins WHERE email = ?')
+    .bind(String(email || '').trim().toLowerCase())
+    .first<{ id: number; password_hash: string; salt: string }>();
+
+  const isValid = admin ? await verifyPassword(String(password || ''), admin.password_hash, admin.salt) : false;
+
+  if (!isValid || !admin) {
+    const nextAttempts = (record?.locked_until && now >= record.locked_until ? 0 : record?.attempts ?? 0) + 1;
+    const lockUntil = nextAttempts >= 5 ? now + 15 * 60 * 1000 : null;
+
+    await db
+      .prepare(
+        `INSERT INTO login_attempts (ip, attempts, locked_until) VALUES (?, ?, ?)
+         ON CONFLICT(ip) DO UPDATE SET attempts = excluded.attempts, locked_until = excluded.locked_until`
+      )
+      .bind(ip, nextAttempts, lockUntil)
+      .run();
+
+    const remaining = Math.max(0, 5 - nextAttempts);
+    return new Response(
+      JSON.stringify({
+        error: lockUntil
+          ? 'Account locked for 15 minutes due to 5 wrong password attempts.'
+          : `Invalid credentials. ${remaining} attempt(s) left before 15-minute lockout.`,
+      }),
+      { status: 401 }
+    );
+  }
+
+  // Reset attempt counter on success
+  await db.prepare('DELETE FROM login_attempts WHERE ip = ?').bind(ip).run();
+
+  const token = await signSession(admin.id, secret);
+  cookies.set('kuraco_admin_session', token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'strict',
+    path: '/',
+    maxAge: 60 * 60 * 24 * 7,
+  });
+
+  return new Response(JSON.stringify({ ok: true }), { status: 200 });
+};
+   import type { APIRoute } from 'astro';
+import { hashPassword, verifyPassword, verifySession } from '../../../lib/auth';
+
+export const POST: APIRoute = async ({ request, locals, cookies }) => {
+  const db = locals.runtime.env.DB;
+  const secret = locals.runtime.env.SESSION_SECRET || 'kuraco-runtime-signing-key-change-in-cf';
+  const adminId = await verifySession(cookies.get('kuraco_admin_session')?.value, secret);
+  if (!adminId) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
+
+  const { currentPassword, newPassword, confirmPassword } = await request.json();
+  if (!newPassword || newPassword.length < 8 || newPassword !== confirmPassword) {
+    return new Response(JSON.stringify({ error: 'New passwords must match and be at least 8 characters.' }), { status: 400 });
+  }
+
+  const admin = await db
+    .prepare('SELECT password_hash, salt FROM admins WHERE id = ?')
+    .bind(adminId)
+    .first<{ password_hash: string; salt: string }>();
+
+  if (!admin || !(await verifyPassword(currentPassword, admin.password_hash, admin.salt))) {
+    return new Response(JSON.stringify({ error: 'Current password is incorrect.' }), { status: 400 });
+  }
+
+  const { hash, salt } = await hashPassword(newPassword);
+  await db.prepare('UPDATE admins SET password_hash = ?, salt = ? WHERE id = ?').bind(hash, salt, adminId).run();
+
+  return new Response(JSON.stringify({ ok: true }), { status: 200 });
+};
+      import type { APIRoute } from 'astro';
+
+export const POST: APIRoute = async ({ request, locals }) => {
+  const r2 = locals.runtime.env.R2;
+  const formData = await request.formData();
+  const file = formData.get('file') as File | null;
+
+  if (!file) {
+    return new Response(JSON.stringify({ error: 'No file provided' }), { status: 400 });
+  }
+
+  const ext = file.name.split('.').pop()?.toLowerCase() || 'jpg';
+  const key = `uploads/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${ext}`;
+
+  await r2.put(key, await file.arrayBuffer(), {
+    httpMetadata: { contentType: file.type || 'image/jpeg' },
+  });
+
+  return new Response(JSON.stringify({ url: `/media/${key}` }), { status: 200 });
+};
+      import type { APIRoute } from 'astro';
+
+export const GET: APIRoute = async ({ params, locals }) => {
+  const key = params.key;
+  if (!key) return new Response('Not Found', { status: 404 });
+
+  const object = await locals.runtime.env.R2.get(key);
+  if (!object) return new Response('Not Found', { status: 404 });
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set('etag', object.httpEtag);
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+
+  return new Response(object.body, { headers });
+};
+      import React, { useState, useRef } from 'react';
+import { ChevronLeft, ChevronRight, Check, ShoppingBag, Sparkles } from 'lucide-react';
+
+export interface RunwayProduct {
+  id: number;
+  slug: string;
+  name: string;
+  price: number;
+  image: string;
+  sizes: string[];
+  role: 'SHIRT' | 'PANT' | 'SHOES';
+}
+
+export interface RunwayLook {
+  id: number;
+  look_name: string;
+  model_image_url: string;
+  full_look_price: number;
+  items: [RunwayProduct, RunwayProduct, RunwayProduct]; // [Shirt, Pant, Shoes]
+}
+
+interface Props {
+  looks: RunwayLook[];
+}
+
+export default function RunwayLookbook({ looks }: Props) {
+  if (!looks || looks.length === 0) return null;
+
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [selectedIds, setSelectedIds] = useState<Record<number, boolean>>(() => {
+    const initial: Record<number, boolean> = {};
+    looks[0].items.forEach((item) => (initial[item.id] = true));
+    return initial;
+  });
+  const [selectedSizes, setSelectedSizes] = useState<Record<number, string>>({});
+  const [addedToast, setAddedToast] = useState<string | null>(null);
+  const touchStartX = useRef<number | null>(null);
+
+  const currentLook = looks[activeIndex];
+
+  const switchLook = (newIdx: number) => {
+    const wrapped = (newIdx + looks.length) % looks.length;
+    setActiveIndex(wrapped);
+    const nextSelected: Record<number, boolean> = {};
+    looks[wrapped].items.forEach((item) => (nextSelected[item.id] = true));
+    setSelectedIds(nextSelected);
+  };
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    touchStartX.current = e.touches[0].clientX;
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent) => {
+    if (touchStartX.current === null) return;
+    const diff = touchStartX.current - e.changedTouches[0].clientX;
+    if (Math.abs(diff) > 45) {
+      switchLook(diff > 0 ? activeIndex + 1 : activeIndex - 1);
+    }
+    touchStartX.current = null;
+  };
+
+  const toggleItem = (id: number) => {
+    setSelectedIds((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const getSize = (item: RunwayProduct) => selectedSizes[item.id] || item.sizes[0] || 'M';
+
+  const individualTotal = currentLook.items.reduce((sum, item) => sum + item.price, 0);
+  const fullLookSavings = Math.max(0, individualTotal - currentLook.full_look_price);
+
+  const selectedItems = currentLook.items.filter((item) => selectedIds[item.id]);
+  const allThreeSelected = selectedItems.length === 3;
+  const selectedTotal = allThreeSelected
+    ? currentLook.full_look_price
+    : selectedItems.reduce((sum, item) => sum + item.price, 0);
+
+  const pushToCart = (entries: { product: RunwayProduct; size: string; priceOverride?: number; bundleTag?: string }[]) => {
+    const existing = JSON.parse(localStorage.getItem('kuraco_cart') || '[]');
+    for (const entry of entries) {
+      const idx = existing.findIndex(
+        (c: any) => c.id === entry.product.id && c.size === entry.size && c.bundleTag === entry.bundleTag
+      );
+      if (idx > -1) {
+        existing[idx].qty += 1;
+      } else {
+        existing.push({
+          id: entry.product.id,
+          slug: entry.product.slug,
+          name: entry.product.name,
+          price: entry.priceOverride ?? entry.product.price,
+          image: entry.product.image,
+          size: entry.size,
+          qty: 1,
+          bundleTag: entry.bundleTag || null,
+        });
+      }
+    }
+    localStorage.setItem('kuraco_cart', JSON.stringify(existing));
+    window.dispatchEvent(new Event('kuraco-cart-updated'));
+    setAddedToast(entries.length === 3 ? `FULL LOOK ADDED — SAVED RS ${fullLookSavings.toLocaleString()}` : 'ADDED TO BAG');
+    setTimeout(() => setAddedToast(null), 2600);
+  };
+
+  const handleBuyFullLook = () => {
+    // Distribute bundle discount proportionally across the 3 pieces
+    const ratio = currentLook.full_look_price / individualTotal;
+    const entries = currentLook.items.map((item, idx) => {
+      const discounted =
+        idx === 2
+          ? currentLook.full_look_price -
+            Math.round(currentLook.items[0].price * ratio) -
+            Math.round(currentLook.items[1].price * ratio)
+          : Math.round(item.price * ratio);
+      return {
+        product: item,
+        size: getSize(item),
+        priceOverride: discounted,
+        bundleTag: currentLook.look_name,
+      };
+    });
+    pushToCart(entries);
+  };
+
+  return (
+    <section className="border-y border-kuraco-border bg-kuraco-offwhite text-kuraco-black">
+      {/* Section Header */}
+      <div className="mx-auto flex max-w-7xl items-end justify-between px-4 pt-12 pb-6 md:px-8">
+        <div>
+          <p className="text-xs font-semibold tracking-[0.25em] text-kuraco-muted uppercase">
+            CURATED EDITORIAL CAPSULE
+          </p>
+          <h2 className="font-display text-4xl tracking-wide md:text-6xl">
+            RUNWAY — SHOP THE LOOK
+          </h2>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="mr-2 font-mono text-xs tracking-widest">
+            {String(activeIndex + 1).padStart(2, '0')} / {String(looks.length).padStart(2, '0')}
+          </span>
+          <button
+            onClick={() => switchLook(activeIndex - 1)}
+            aria-label="Previous Look"
+            className="flex h-10 w-10 items-center justify-center border border-kuraco-black bg-white transition hover:bg-kuraco-black hover:text-white"
+          >
+            <ChevronLeft className="h-5 w-5" />
+          </button>
+          <button
+            onClick={() => switchLook(activeIndex + 1)}
+            aria-label="Next Look"
+            className="flex h-10 w-10 items-center justify-center border border-kuraco-black bg-white transition hover:bg-kuraco-black hover:text-white"
+          >
+            <ChevronRight className="h-5 w-5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Main Split Stage */}
+      <div className="mx-auto grid max-w-7xl grid-cols-1 gap-8 px-4 pb-24 md:grid-cols-12 md:px-8 md:pb-16">
+        {/* LEFT / TOP: Depth Runway Line (Swipeable) */}
+        <div
+          onTouchStart={handleTouchStart}
+          onTouchEnd={handleTouchEnd}
+          className="relative flex h-[480px] select-none items-center justify-center overflow-hidden border border-kuraco-border bg-white md:col-span-6 md:h-[640px]"
+        >
+          {/* Runway Floor Perspective Lines */}
+          <div
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-32 opacity-20"
+            style={{
+              backgroundImage:
+                'linear-gradient(to right, #0A0A0A 1px, transparent 1px), linear-gradient(to bottom, #0A0A0A 1px, transparent 1px)',
+              backgroundSize: '48px 24px',
+              transform: 'perspective(300px) rotateX(60deg)',
+            }}
+          />
+
+          {/* Render Models in Runway Depth Line */}
+          {looks.map((look, idx) => {
+            const offset = idx - activeIndex;
+            const isCenter = offset === 0;
+            const isVisible = Math.abs(offset) <= 2;
+            if (!isVisible) return null;
+
+            const scale = isCenter ? 1 : Math.abs(offset) === 1 ? 0.72 : 0.52;
+            const translateX = offset * 145;
+            const translateY = isCenter ? 0 : -28 * Math.abs(offset);
+            const blur = isCenter ? 'blur(0px)' : Math.abs(offset) === 1 ? 'blur(2.5px)' : 'blur(5px)';
+            const opacity = isCenter ? 1 : Math.abs(offset) === 1 ? 0.55 : 0.25;
+            const zIndex = 30 - Math.abs(offset) * 10;
+
+            return (
+              <div
+                key={look.id}
+                onClick={() => !isCenter && switchLook(idx)}
+                style={{
+                  transform: `translateX(${translateX}px) translateY(${translateY}px) scale(${scale})`,
+                  filter: blur,
+                  opacity,
+                  zIndex,
+                }}
+                className={`absolute inset-y-4 flex w-[76%] max-w-[340px] flex-col items-center justify-end transition-all duration-500 ease-out md:w-[65%] ${
+                  !isCenter ? 'cursor-pointer' : ''
+                }`}
+              >
+                <img
+                  src={look.model_image_url}
+                  alt={look.look_name}
+                  className="h-full w-full object-cover object-top shadow-2xl"
+                />
+              </div>
+            );
+          })}
+
+          {/* Active Look Badge Overlay */}
+          <div className="absolute top-4 left-4 z-40 bg-kuraco-black px-3 py-1.5 text-white">
+            <span className="font-display text-lg tracking-widest">{currentLook.look_name}</span>
+          </div>
+
+          {/* Mobile Swipe Hint */}
+          <div className="absolute bottom-3 left-1/2 z-40 -translate-x-1/2 bg-white/90 px-3 py-1 text-[10px] font-medium tracking-[0.2em] uppercase backdrop-blur md:hidden">
+            SWIPE TO WALK RUNWAY
+          </div>
+        </div>
+
+        {/* RIGHT / BOTTOM: The 3 Linked Products (1. Shirt, 2. Pant, 3. Shoes) */}
+        <div className="flex flex-col justify-between md:col-span-6">
+          <div>
+            <div className="mb-4 flex items-center justify-between border-b border-kuraco-border pb-3">
+              <span className="text-xs font-semibold tracking-[0.2em] uppercase">
+                PIECES IN {currentLook.look_name}
+              </span>
+              <span className="text-xs text-kuraco-muted">SELECT ITEMS OR BUY COMPLETE LOOK</span>
+            </div>
+
+            {/* Horizontal scroll cards on mobile, stacked architectural rows on desktop */}
+            <div className="flex gap-3 overflow-x-auto pb-2 md:flex-col md:gap-4 md:overflow-visible">
+              {currentLook.items.map((item, idx) => {
+                const checked = !!selectedIds[item.id];
+                return (
+                  <div
+                    key={item.id}
+                    className={`min-w-[260px] flex-1 border transition md:min-w-0 ${
+                      checked ? 'border-kuraco-black bg-white' : 'border-kuraco-border bg-white/60 opacity-75'
+                    } p-3 md:p-4`}
+                  >
+                    <div className="flex items-center gap-3.5">
+                      {/* Selection Checkbox */}
+                      <button
+                        type="button"
+                        onClick={() => toggleItem(item.id)}
+                        aria-label={`Select ${item.name}`}
+                        className={`flex h-5 w-5 shrink-0 items-center justify-center border transition ${
+                          checked ? 'border-kuraco-black bg-kuraco-black text-white' : 'border-kuraco-muted bg-white'
+                        }`}
+                      >
+                        {checked && <Check className="h-3.5 w-3.5" />}
+                      </button>
+
+                      {/* Product Thumbnail */}
+                      <a href={`/product/${item.slug}`} className="h-20 w-16 shrink-0 overflow-hidden bg-kuraco-offwhite">
+                        <img src={item.image} alt={item.name} className="h-full w-full object-cover" />
+                      </a>
+
+                      {/* Info & Controls */}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[10px] font-bold tracking-[0.2em] text-kuraco-muted uppercase">
+                            0{idx + 1} · {item.role}
+                          </span>
+                          <span className="text-sm font-semibold">Rs {item.price.toLocaleString()}</span>
+                        </div>
+                        <a
+                          href={`/product/${item.slug}`}
+                          className="mt-0.5 block truncate text-sm font-medium hover:underline"
+                        >
+                          {item.name}
+                        </a>
+
+                        <div className="mt-2.5 flex items-center justify-between gap-2">
+                          {/* Size Selector */}
+                          <select
+                            value={getSize(item)}
+                            onChange={(e) => setSelectedSizes((s) => ({ ...s, [item.id]: e.target.value }))}
+                            className="border border-kuraco-border bg-kuraco-offwhite px-2 py-1 text-xs font-medium focus:border-kuraco-black focus:outline-none"
+                          >
+                            {item.sizes.map((sz) => (
+                              <option key={sz} value={sz}>
+                                SIZE {sz}
+                              </option>
+                            ))}
+                          </select>
+
+                          {/* Individual Add Button */}
+                          <button
+                            type="button"
+                            onClick={() => pushToCart([{ product: item, size: getSize(item) }])}
+                            className="border border-kuraco-black px-3 py-1 text-xs font-semibold tracking-wider uppercase transition hover:bg-kuraco-black hover:text-white"
+                          >
+                            + ADD
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Dynamic Selection Summary + Full Look Bundle Button */}
+          <div className="fixed inset-x-0 bottom-0 z-40 border-t border-kuraco-black bg-white p-4 shadow-2xl md:static md:mt-6 md:border md:p-5 md:shadow-none">
+            <div className="mb-3 flex items-center justify-between text-xs">
+              <span className="font-medium text-kuraco-muted uppercase">
+                SELECTED ({selectedItems.length}/3 ITEMS):
+              </span>
+              <div className="text-right">
+                {allThreeSelected && fullLookSavings > 0 && (
+                  <span className="mr-2 text-kuraco-muted line-through">
+                    Rs {individualTotal.toLocaleString()}
+                  </span>
+                )}
+                <span className="text-base font-bold">Rs {selectedTotal.toLocaleString()}</span>
+              </div>
+            </div>
+
+            {allThreeSelected ? (
+              <button
+                type="button"
+                onClick={handleBuyFullLook}
+                className="flex w-full items-center justify-center gap-2 bg-kuraco-black py-4 font-display text-xl tracking-widest text-white transition hover:bg-neutral-800"
+              >
+                <Sparkles className="h-5 w-5" />
+                BUY FULL LOOK — RS {currentLook.full_look_price.toLocaleString()}{' '}
+                {fullLookSavings > 0 && `(SAVE RS ${fullLookSavings.toLocaleString()})`}
+              </button>
+            ) : (
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <button
+                  type="button"
+                  disabled={selectedItems.length === 0}
+                  onClick={() =>
+                    pushToCart(selectedItems.map((item) => ({ product: item, size: getSize(item) })))
+                  }
+                  className="flex items-center justify-center gap-2 border border-kuraco-black bg-white py-3.5 text-xs font-bold tracking-widest uppercase transition hover:bg-kuraco-offwhite disabled:opacity-40"
+                >
+                  <ShoppingBag className="h-4 w-4" />
+                  ADD SELECTED — RS {selectedTotal.toLocaleString()}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleBuyFullLook}
+                  className="flex items-center justify-center gap-1.5 bg-kuraco-black py-3.5 text-xs font-bold tracking-widest text-white uppercase transition hover:bg-neutral-800"
+                >
+                  BUY FULL LOOK — RS {currentLook.full_look_price.toLocaleString()}
+                </button>
+              </div>
+            )}
+
+            {addedToast && (
+              <div className="mt-2 bg-kuraco-black py-1.5 text-center text-xs font-semibold tracking-widest text-white">
+                {addedToast}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+    ---
+import Navbar from '../components/storefront/Navbar.astro';
+import RunwayLookbook, { type RunwayLook } from '../components/storefront/RunwayLookbook';
+import { ArrowRight, Star, Package, ShieldCheck } from 'lucide-react';
+
+const db = Astro.locals.runtime.env.DB;
+
+const settings = await db.prepare('SELECT * FROM store_settings WHERE id = 1').first<any>();
+const banner = await db.prepare('SELECT * FROM banners WHERE id = 1').first<any>();
+
+const { results: bestProducts } = await db
+  .prepare('SELECT * FROM products WHERE is_active = 1 ORDER BY is_featured DESC, created_at DESC LIMIT 8')
+  .all<any>();
+
+const { results: activeBundles } = await db
+  .prepare('SELECT * FROM bundles WHERE is_active = 1 ORDER BY id DESC')
+  .all<any>();
+
+const { results: approvedReviews } = await db
+  .prepare(
+    `SELECT r.id, r.customer_name, r.rating, r.review_text, r.photo_url, p.name as product_name
+     FROM reviews r LEFT JOIN products p ON r.product_id = p.id
+     WHERE r.is_approved = 1 ORDER BY r.created_at DESC LIMIT 6`
+  )
+  .all<any>();
+
+// Fetch Runway Looks with their 3 linked products (Shirt, Pant, Shoes)
+const { results: rawLooks } = await db
+  .prepare('SELECT * FROM runway_looks WHERE is_active = 1 ORDER BY sort_order ASC, id ASC')
+  .all<any>();
+
+const runwayLooks: RunwayLook[] = [];
+for (const look of rawLooks) {
+  const shirt = await db.prepare('SELECT * FROM products WHERE id = ?').bind(look.shirt_product_id).first<any>();
+  const pant = await db.prepare('SELECT * FROM products WHERE id = ?').bind(look.pant_product_id).first<any>();
+  const shoes = await db.prepare('SELECT * FROM products WHERE id = ?').bind(look.shoes_product_id).first<any>();
+  if (shirt && pant && shoes) {
+    runwayLooks.push({
+      id: look.id,
+      look_name: look.look_name,
+      model_image_url: look.model_image_url,
+      full_look_price: look.full_look_price,
+      items: [
+        { id: shirt.id, slug: shirt.slug, name: shirt.name, price: shirt.price, image: JSON.parse(shirt.images)[0] || '', sizes: JSON.parse(shirt.sizes), role: 'SHIRT' },
+        { id: pant.id, slug: pant.slug, name: pant.name, price: pant.price, image: JSON.parse(pant.images)[0] || '', sizes: JSON.parse(pant.sizes), role: 'PANT' },
+        { id: shoes.id, slug: shoes.slug, name: shoes.name, price: shoes.price, image: JSON.parse(shoes.images)[0] || '', sizes: JSON.parse(shoes.sizes), role: 'SHOES' },
+      ],
+    });
+  }
+}
+
+const bgClass =
+  settings?.theme_mode === 'black'
+    ? 'bg-kuraco-black text-white'
+    : settings?.theme_mode === 'white'
+    ? 'bg-white text-kuraco-black'
+    : 'bg-kuraco-offwhite text-kuraco-black';
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{settings?.store_name || 'KURACO'} — Minimal Luxury Fashion</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class={`${bgClass} font-sans antialiased`}>
+    <Navbar settings={settings} />
+
+    {/* 1. BIG TOP BANNER */}
+    {settings?.section_banner === 1 && (
+      <section class="relative h-[78vh] min-h-[520px] w-full overflow-hidden bg-kuraco-black text-white">
+        {banner?.image_url && (
+          <img
+            src={banner.image_url}
+            alt={banner.heading}
+            class="absolute inset-0 h-full w-full object-cover opacity-80"
+          />
+        )}
+        <div class="absolute inset-0 bg-gradient-to-t from-black/75 via-black/25 to-transparent" />
+        <div class="relative mx-auto flex h-full max-w-7xl flex-col justify-end px-4 pb-16 md:px-8">
+          <span class="mb-2 inline-block w-fit bg-white px-3 py-1 text-xs font-bold tracking-[0.25em] text-kuraco-black uppercase">
+            SEASON 01 COLLECTION
+          </span>
+          <h1 class="font-display text-6xl leading-none tracking-wider md:text-8xl">
+            {banner?.heading || 'NEW DROP'}
+          </h1>
+          <p class="mt-3 max-w-lg text-sm tracking-wide text-neutral-200 md:text-base">
+            {banner?.subtext || 'ARCHITECTURAL SILHOUETTES FOR THE MODERN WARDROBE'}
+          </p>
+          <a
+            href={banner?.button_link || '/shop'}
+            class="mt-6 inline-flex w-fit items-center gap-3 bg-white px-8 py-4 font-display text-xl tracking-widest text-kuraco-black transition hover:bg-kuraco-offwhite"
+          >
+            {banner?.button_text || 'SHOP NOW'}
+            <ArrowRight className="h-5 w-5" />
+          </a>
+        </div>
+      </section>
+    )}
+
+    {/* 2. PART 3: RUNWAY - SHOP THE LOOK (Directly below Banner) */}
+    {settings?.section_runway === 1 && runwayLooks.length > 0 && (
+      <RunwayLookbook client:load looks={runwayLooks} />
+    )}
+
+    {/* 3. 8 BEST PRODUCTS */}
+    {settings?.section_best_products === 1 && (
+      <section class="mx-auto max-w-7xl px-4 py-16 md:px-8">
+        <div class="mb-8 flex items-end justify-between">
+          <div>
+            <p class="text-xs font-semibold tracking-[0.25em] text-kuraco-muted uppercase">CURATED ESSENTIALS</p>
+            <h2 class="font-display text-4xl tracking-wide md:text-5xl">BEST SELLERS</h2>
+          </div>
+          <a href="/shop" class="border-b border-current pb-1 text-xs font-bold tracking-widest uppercase">
+            VIEW ALL
+          </a>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4 md:grid-cols-4 md:gap-6">
+          {bestProducts.map((product) => {
+            const imgs = JSON.parse(product.images || '[]');
+            return (
+              <a href={`/product/${product.slug}`} class="group block bg-white p-2.5 text-kuraco-black border border-kuraco-border">
+                <div class="relative aspect-[3/4] overflow-hidden bg-kuraco-offwhite">
+                  <img
+                    src={imgs[0] || ''}
+                    alt={product.name}
+                    class="h-full w-full object-cover transition duration-500 group-hover:scale-105"
+                  />
+                  {product.stock <= 0 && (
+                    <span class="absolute top-2 left-2 bg-kuraco-black px-2 py-1 text-[10px] font-bold tracking-widest text-white">
+                      SOLD OUT
+                    </span>
+                  )}
+                </div>
+                <div class="pt-3">
+                  <p class="text-[10px] tracking-[0.2em] text-kuraco-muted uppercase">{product.category}</p>
+                  <h3 class="mt-0.5 truncate text-sm font-medium">{product.name}</h3>
+                  <div class="mt-1 flex items-center gap-2">
+                    <span class="text-sm font-bold">Rs {product.price.toLocaleString()}</span>
+                    {product.old_price && (
+                      <span class="text-xs text-kuraco-muted line-through">Rs {product.old_price.toLocaleString()}</span>
+                    )}
+                  </div>
+                </div>
+              </a>
+            );
+          })}
+        </div>
+      </section>
+    )}
+
+    {/* 4. BUNDLES SECTION */}
+    {settings?.section_bundles === 1 && activeBundles.length > 0 && (
+      <section class="border-t border-kuraco-border bg-white py-16 text-kuraco-black">
+        <div class="mx-auto max-w-7xl px-4 md:px-8">
+          <p class="text-xs font-semibold tracking-[0.25em] text-kuraco-muted uppercase">EXCLUSIVE SETS</p>
+          <h2 class="mb-8 font-display text-4xl tracking-wide md:text-5xl">CURATED BUNDLES</h2>
+          <div class="grid grid-cols-1 gap-6 md:grid-cols-2">
+            {activeBundles.map((bundle) => (
+              <div class="flex flex-col justify-between border border-kuraco-black bg-kuraco-offwhite p-6 md:p-8">
+                <div>
+                  <span class="inline-flex items-center gap-1.5 bg-kuraco-black px-3 py-1 text-[10px] font-bold tracking-widest text-white uppercase">
+                    <Package className="h-3.5 w-3.5" /> {bundle.badge_text}
+                  </span>
+                  <h3 class="mt-4 font-display text-3xl tracking-wide">{bundle.title}</h3>
+                  {bundle.bundle_price && (
+                    <p class="mt-1 text-lg font-bold">Bundle Price: Rs {bundle.bundle_price.toLocaleString()}</p>
+                  )}
+                </div>
+                <a
+                  href="/shop"
+                  class="mt-6 inline-flex w-fit items-center gap-2 bg-kuraco-black px-6 py-3 text-xs font-bold tracking-widest text-white uppercase"
+                >
+                  CLAIM BUNDLE <ArrowRight className="h-4 w-4" />
+                </a>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+    )}
+
+    {/* 5. APPROVED REVIEWS SECTION (Zero private customer info exposed) */}
+    {settings?.section_reviews === 1 && approvedReviews.length > 0 && (
+      <section class="mx-auto max-w-7xl px-4 py-16 md:px-8">
+        <div class="mb-8">
+          <p class="text-xs font-semibold tracking-[0.25em] text-kuraco-muted uppercase">VERIFIED CLIENTELE</p>
+          <h2 class="font-display text-4xl tracking-wide md:text-5xl">CLIENT REVIEWS</h2>
+        </div>
+        <div class="grid grid-cols-1 gap-6 md:grid-cols-3">
+          {approvedReviews.map((rev) => (
+            <div class="border border-kuraco-border bg-white p-6 text-kuraco-black">
+              <div class="flex items-center gap-1">
+                {Array.from({ length: rev.rating }).map(() => (
+                  <Star className="h-4 w-4 fill-kuraco-black text-kuraco-black" />
+                ))}
+              </div>
+              <p class="mt-4 text-sm leading-relaxed">"{rev.review_text}"</p>
+              {rev.photo_url && (
+                <img src={rev.photo_url} alt="Review" className="mt-4 h-24 w-24 object-cover border border-kuraco-border" />
+              )}
+              <div class="mt-4 border-t border-kuraco-border pt-3 text-xs">
+                <span class="font-bold uppercase">{rev.customer_name}</span>
+                {rev.product_name && <span class="text-kuraco-muted"> — {rev.product_name}</span>}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+    )}
+
+    {/* Footer (No link to Admin Panel anywhere!) */}
+    <footer class="border-t border-kuraco-border bg-kuraco-black py-12 text-white">
+      <div class="mx-auto flex max-w-7xl flex-col items-start justify-between gap-6 px-4 md:flex-row md:items-center md:px-8">
+        <div>
+          <span class="font-display text-3xl tracking-widest">{settings?.store_name || 'KURACO'}</span>
+          <p class="mt-1 flex items-center gap-1.5 text-xs text-neutral-400">
+            <ShieldCheck className="h-4 w-4" /> CASH ON DELIVERY AVAILABLE PAN-INDIA
+          </p>
+        </div>
+        <div class="flex gap-6 text-xs tracking-widest uppercase">
+          <a href="/shop">Shop</a>
+          <a href="/cart">Bag</a>
+          {settings?.instagram_url && <a href={settings.instagram_url} target="_blank" rel="noreferrer">Instagram</a>}
+          {settings?.whatsapp_number && (
+            <a href={`https://wa.me/${settings.whatsapp_number.replace(/\D/g, '')}`} target="_blank" rel="noreferrer">
+              WhatsApp
+            </a>
+          )}
+        </div>
+      </div>
+    </footer>
+  </body>
+        </html>
+      ---
+import Navbar from '../../components/storefront/Navbar.astro';
+import { Star, Tag, Check } from 'lucide-react';
+
+const { slug } = Astro.params;
+const db = Astro.locals.runtime.env.DB;
+const settings = await db.prepare('SELECT * FROM store_settings WHERE id = 1').first<any>();
+const product = await db.prepare('SELECT * FROM products WHERE slug = ? AND is_active = 1').bind(slug).first<any>();
+
+if (!product) return Astro.redirect('/shop');
+
+const images: string[] = JSON.parse(product.images || '[]');
+const sizes: string[] = JSON.parse(product.sizes || '["S","M","L","XL"]');
+
+// Check if product is part of any active bundle (e.g. Buy 2 Get 1)
+const { results: bundles } = await db.prepare('SELECT * FROM bundles WHERE is_active = 1').all<any>();
+const matchingBundle = bundles.find((b) => {
+  const ids: number[] = JSON.parse(b.product_ids || '[]');
+  return ids.length === 0 || ids.includes(product.id);
+});
+
+const { results: reviews } = await db
+  .prepare('SELECT customer_name, rating, review_text, photo_url FROM reviews WHERE product_id = ? AND is_approved = 1 ORDER BY id DESC')
+  .bind(product.id)
+  .all<any>();
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{product.name} — {settings?.store_name || 'KURACO'}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class="bg-kuraco-offwhite font-sans text-kuraco-black antialiased">
+    <Navbar settings={settings} />
+
+    <main class="mx-auto grid max-w-7xl grid-cols-1 gap-10 px-4 py-10 md:grid-cols-12 md:px-8">
+      {/* Big Photo */}
+      <div class="md:col-span-7">
+        <div class="aspect-[3/4] w-full overflow-hidden border border-kuraco-border bg-white">
+          <img src={images[0] || ''} alt={product.name} class="h-full w-full object-cover" />
+        </div>
+      </div>
+
+      {/* Product Details */}
+      <div class="flex flex-col justify-center md:col-span-5">
+        <p class="text-xs font-semibold tracking-[0.25em] text-kuraco-muted uppercase">{product.category}</p>
+        <h1 class="mt-1 font-display text-5xl tracking-wide">{product.name}</h1>
+
+        <div class="mt-3 flex items-center gap-3">
+          <span class="text-2xl font-bold">Rs {product.price.toLocaleString()}</span>
+          {product.old_price && (
+            <span class="text-base text-kuraco-muted line-through">Rs {product.old_price.toLocaleString()}</span>
+          )}
+        </div>
+
+        {/* Active Bundle Offer Callout */}
+        {matchingBundle && (
+          <div class="mt-5 flex items-center gap-3 border border-kuraco-black bg-white p-3.5">
+            <Tag className="h-5 w-5 shrink-0" />
+            <div>
+              <p class="text-xs font-bold tracking-widest uppercase">
+                {matchingBundle.bundle_type === 'BUY_2_GET_1' ? 'BUY 2 GET 1 FREE OFFER ACTIVE' : matchingBundle.title}
+              </p>
+              <p class="text-xs text-kuraco-muted">{matchingBundle.title}</p>
+            </div>
+          </div>
+        )}
+
+        {/* Size Selector S M L XL */}
+        <div class="mt-6">
+          <label class="text-xs font-bold tracking-widest uppercase">SELECT SIZE</label>
+          <div id="size-group" class="mt-2 flex gap-2">
+            {sizes.map((sz, idx) => (
+              <button
+                type="button"
+                data-size={sz}
+                class={`size-btn h-11 w-14 border text-xs font-bold transition ${
+                  idx === 0 ? 'border-kuraco-black bg-kuraco-black text-white' : 'border-kuraco-border bg-white text-kuraco-black'
+                }`}
+              >
+                {sz}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Add to Cart */}
+        <button
+          id="add-to-cart-btn"
+          disabled={product.stock <= 0}
+          class="mt-8 w-full bg-kuraco-black py-4 font-display text-2xl tracking-widest text-white transition hover:bg-neutral-800 disabled:bg-neutral-400"
+        >
+          {product.stock > 0 ? 'ADD TO CART' : 'OUT OF STOCK'}
+        </button>
+        <p id="cart-feedback" class="mt-2 hidden items-center justify-center gap-1 text-xs font-bold tracking-widest uppercase">
+          <Check className="h-4 w-4" /> ADDED TO YOUR BAG
+        </p>
+
+        <p class="mt-6 border-t border-kuraco-border pt-6 text-sm leading-relaxed text-neutral-700">
+          {product.description}
+        </p>
+      </div>
+    </main>
+
+    {/* Reviews of this product */}
+    <section class="mx-auto max-w-7xl border-t border-kuraco-border px-4 py-12 md:px-8">
+      <h2 class="font-display text-3xl tracking-wide">PRODUCT REVIEWS ({reviews.length})</h2>
+      {reviews.length === 0 ? (
+        <p class="mt-3 text-sm text-kuraco-muted">No verified reviews for this piece yet.</p>
+      ) : (
+        <div class="mt-6 grid grid-cols-1 gap-4 md:grid-cols-3">
+          {reviews.map((r) => (
+            <div class="border border-kuraco-border bg-white p-5">
+              <div class="flex gap-1">
+                {Array.from({ length: r.rating }).map(() => (
+                  <Star className="h-4 w-4 fill-kuraco-black" />
+                ))}
+              </div>
+              <p class="mt-3 text-sm">"{r.review_text}"</p>
+              <p class="mt-3 text-xs font-bold uppercase">{r.customer_name}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+
+    <script define:vars={{ product: { id: product.id, slug: product.slug, name: product.name, price: product.price, image: images[0] || '' }, defaultSize: sizes[0] || 'M' }}>
+      let selectedSize = defaultSize;
+      document.querySelectorAll('.size-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          selectedSize = btn.getAttribute('data-size');
+          document.querySelectorAll('.size-btn').forEach((b) => {
+            b.classList.remove('bg-kuraco-black', 'text-white', 'border-kuraco-black');
+            b.classList.add('bg-white', 'text-kuraco-black', 'border-kuraco-border');
+          });
+          btn.classList.add('bg-kuraco-black', 'text-white', 'border-kuraco-black');
+        });
+      });
+
+      document.getElementById('add-to-cart-btn')?.addEventListener('click', () => {
+        const cart = JSON.parse(localStorage.getItem('kuraco_cart') || '[]');
+        const idx = cart.findIndex((i) => i.id === product.id && i.size === selectedSize);
+        if (idx > -1) cart[idx].qty += 1;
+        else cart.push({ ...product, size: selectedSize, qty: 1 });
+        localStorage.setItem('kuraco_cart', JSON.stringify(cart));
+        const fb = document.getElementById('cart-feedback');
+        fb?.classList.remove('hidden');
+        fb?.classList.add('flex');
+      });
+    </script>
+  </body>
+    </html>
+    import type { APIRoute } from 'astro';
+
+export const POST: APIRoute = async ({ request, locals }) => {
+  const db = locals.runtime.env.DB;
+  const { name, phone, address, pincode, items } = await request.json();
+
+  if (!name || !phone || !address || !pincode || !Array.isArray(items) || items.length === 0) {
+    return new Response(JSON.stringify({ error: 'All fields and at least one item are required.' }), { status: 400 });
+  }
+
+  const cleanPhone = String(phone).trim();
+
+  // Check if customer is blocked by admin
+  const existingCustomer = await db
+    .prepare('SELECT id, is_blocked FROM customers WHERE phone = ?')
+    .bind(cleanPhone)
+    .first<{ id: number; is_blocked: number }>();
+
+  if (existingCustomer?.is_blocked === 1) {
+    return new Response(JSON.stringify({ error: 'Unable to place order with this phone number.' }), { status: 403 });
+  }
+
+  // Re-verify prices & stock on server side
+  let subtotal = 0;
+  for (const item of items) {
+    const prod = await db.prepare('SELECT price, stock FROM products WHERE id = ?').bind(item.id).first<{ price: number; stock: number }>();
+    if (!prod || prod.stock < item.qty) {
+      return new Response(JSON.stringify({ error: `${item.name} is out of stock.` }), { status: 400 });
+    }
+    const unitPrice = item.bundleTag ? Number(item.price) : prod.price;
+    subtotal += unitPrice * Number(item.qty);
+  }
+
+  // Apply active Buy 2 Get 1 bundle discount if applicable
+  const b2g1 = await db
+    .prepare("SELECT * FROM bundles WHERE is_active = 1 AND bundle_type = 'BUY_2_GET_1' LIMIT 1")
+    .first<any>();
+
+  let discount = 0;
+  if (b2g1) {
+    const totalUnits = items.reduce((acc: number, i: any) => acc + Number(i.qty), 0);
+    if (totalUnits >= 3) {
+      const sortedPrices = items
+        .flatMap((i: any) => Array(Number(i.qty)).fill(Number(i.price)))
+        .sort((a: number, b: number) => a - b);
+      discount = sortedPrices[0]; // Cheapest item free
+    }
+  }
+
+  const total = Math.max(0, subtotal - discount);
+  const orderNumber = `KRC-${Date.now().toString().slice(-6)}`;
+
+  // Upsert customer record (private to admin)
+  let customerId = existingCustomer?.id;
+  if (customerId) {
+    await db
+      .prepare(
+        `UPDATE customers SET name = ?, address = ?, pincode = ?, total_orders = total_orders + 1, total_spent = total_spent + ? WHERE id = ?`
+      )
+      .bind(name.trim(), address.trim(), pincode.trim(), total, customerId)
+      .run();
+  } else {
+    const custRes = await db
+      .prepare(
+        `INSERT INTO customers (name, phone, address, pincode, total_orders, total_spent) VALUES (?, ?, ?, ?, 1, ?)`
+      )
+      .bind(name.trim(), cleanPhone, address.trim(), pincode.trim(), total)
+      .run();
+    customerId = Number(custRes.meta.last_row_id);
+  }
+
+  // Create COD order & decrement inventory
+  await db
+    .prepare(
+      `INSERT INTO orders (order_number, customer_id, customer_name, customer_phone, shipping_address, pincode, items_json, subtotal, discount, total, payment_method, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COD', 'New')`
+    )
+    .bind(orderNumber, customerId, name.trim(), cleanPhone, address.trim(), pincode.trim(), JSON.stringify(items), subtotal, discount, total)
+    .run();
+
+  for (const item of items) {
+    await db.prepare('UPDATE products SET stock = stock - ? WHERE id = ?').bind(item.qty, item.id).run();
+  }
+
+  return new Response(JSON.stringify({ ok: true, orderNumber, total }), { status: 201 });
+};
+   ---
+import Navbar from '../components/storefront/Navbar.astro';
+const db = Astro.locals.runtime.env.DB;
+const settings = await db.prepare('SELECT * FROM store_settings WHERE id = 1').first<any>();
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Checkout — {settings?.store_name || 'KURACO'}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class="bg-kuraco-offwhite font-sans text-kuraco-black">
+    <Navbar settings={settings} />
+
+    <main class="mx-auto max-w-2xl px-4 py-12">
+      <h1 class="font-display text-4xl tracking-wide">CASH ON DELIVERY CHECKOUT</h1>
+      <p class="mt-1 text-xs tracking-widest text-kuraco-muted uppercase">PAY IN CASH WHEN YOUR ORDER ARRIVES</p>
+
+      <form id="checkout-form" class="mt-8 space-y-4 border border-kuraco-border bg-white p-6">
+        <div>
+          <label class="block text-xs font-bold tracking-widest uppercase">FULL NAME *</label>
+          <input name="name" required class="mt-1 w-full border border-kuraco-border px-3 py-3 text-sm focus:border-kuraco-black focus:outline-none" />
+        </div>
+        <div>
+          <label class="block text-xs font-bold tracking-widest uppercase">PHONE NUMBER *</label>
+          <input name="phone" type="tel" required class="mt-1 w-full border border-kuraco-border px-3 py-3 text-sm focus:border-kuraco-black focus:outline-none" />
+        </div>
+        <div>
+          <label class="block text-xs font-bold tracking-widest uppercase">FULL SHIPPING ADDRESS *</label>
+          <textarea name="address" rows="3" required class="mt-1 w-full border border-kuraco-border px-3 py-3 text-sm focus:border-kuraco-black focus:outline-none"></textarea>
+        </div>
+        <div>
+          <label class="block text-xs font-bold tracking-widest uppercase">PINCODE *</label>
+          <input name="pincode" required class="mt-1 w-full border border-kuraco-border px-3 py-3 text-sm focus:border-kuraco-black focus:outline-none" />
+        </div>
+
+        <div class="border-t border-kuraco-border pt-4">
+          <div class="flex items-center justify-between text-sm font-bold">
+            <span>PAYMENT METHOD</span>
+            <span>CASH ON DELIVERY (COD)</span>
+          </div>
+          <div class="mt-2 flex items-center justify-between text-lg font-bold">
+            <span>ORDER TOTAL</span>
+            <span id="checkout-total">Rs 0</span>
+          </div>
+        </div>
+
+        <p id="checkout-error" class="hidden text-xs font-bold text-red-600"></p>
+
+        <button type="submit" class="w-full bg-kuraco-black py-4 font-display text-2xl tracking-widest text-white hover:bg-neutral-800">
+          PLACE ORDER
+        </button>
+      </form>
+
+      <div id="order-success" class="mt-8 hidden border border-kuraco-black bg-white p-8 text-center">
+        <h2 class="font-display text-4xl">ORDER CONFIRMED</h2>
+        <p class="mt-2 text-sm text-kuraco-muted">Your order reference is <strong id="order-ref" class="text-kuraco-black"></strong>.</p>
+        <a href="/shop" class="mt-6 inline-block bg-kuraco-black px-8 py-3 text-xs font-bold tracking-widest text-white uppercase">
+          CONTINUE SHOPPING
+        </a>
+      </div>
+    </main>
+
+    <script>
+      const cart = JSON.parse(localStorage.getItem('kuraco_cart') || '[]');
+      const total = cart.reduce((sum: number, item: any) => sum + item.price * item.qty, 0);
+      const totalEl = document.getElementById('checkout-total');
+      if (totalEl) totalEl.textContent = `Rs ${total.toLocaleString()}`;
+
+      document.getElementById('checkout-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const form = e.target as HTMLFormElement;
+        const data = Object.fromEntries(new FormData(form).entries());
+        const errEl = document.getElementById('checkout-error')!;
+
+        const res = await fetch('/api/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...data, items: cart }),
+        });
+        const json = await res.json();
+        if (!res.ok) {
+          errEl.textContent = json.error || 'Failed to place order';
+          errEl.classList.remove('hidden');
+          return;
+        }
+
+        localStorage.removeItem('kuraco_cart');
+        form.classList.add('hidden');
+        document.getElementById('order-ref')!.textContent = json.orderNumber;
+        document.getElementById('order-success')!.classList.remove('hidden');
+      });
+    </script>
+  </body>
+                                                                                          </html>
+            ---
+---
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Admin Setup — KURACO</title>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class="flex min-h-screen items-center justify-center bg-kuraco-offwhite p-4 font-sans text-kuraco-black">
+    <div class="w-full max-w-md border border-kuraco-black bg-white p-8">
+      <p class="text-xs font-bold tracking-[0.25em] text-kuraco-muted uppercase">INITIAL SYSTEM CONFIGURATION</p>
+      <h1 class="mt-1 font-display text-4xl tracking-wide">CREATE ADMIN ACCOUNT</h1>
+      <p class="mt-2 text-xs text-kuraco-muted">
+        Once created, this setup route will permanently lock. Store your credentials securely.
+      </p>
+
+      <form id="setup-form" class="mt-6 space-y-4">
+        <div>
+          <label class="block text-xs font-bold tracking-widest uppercase">ADMIN EMAIL</label>
+          <input name="email" type="email" required class="mt-1 w-full border border-kuraco-border px-3 py-2.5 text-sm" />
+        </div>
+        <div>
+          <label class="block text-xs font-bold tracking-widest uppercase">PASSWORD (MIN 8 CHARS)</label>
+          <input name="password" type="password" minlength="8" required class="mt-1 w-full border border-kuraco-border px-3 py-2.5 text-sm" />
+        </div>
+        <div>
+          <label class="block text-xs font-bold tracking-widest uppercase">CONFIRM PASSWORD</label>
+          <input name="confirmPassword" type="password" minlength="8" required class="mt-1 w-full border border-kuraco-border px-3 py-2.5 text-sm" />
+        </div>
+        <p id="err" class="hidden text-xs font-semibold text-red-600"></p>
+        <button type="submit" class="w-full bg-kuraco-black py-3.5 font-display text-xl tracking-widest text-white">
+          INITIALIZE ADMIN
+        </button>
+      </form>
+    </div>
+
+    <script>
+      document.getElementById('setup-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const body = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries());
+        const res = await fetch('/api/auth/setup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const err = document.getElementById('err')!;
+          err.textContent = data.error;
+          err.classList.remove('hidden');
+          return;
+        }
+        window.location.href = '/kuracoadmin10';
+      });
+    </script>
+  </body>
+                                                                                   </html>
+        ---
+---
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Admin Login — KURACO</title>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class="flex min-h-screen items-center justify-center bg-kuraco-black p-4 font-sans text-white">
+    <div class="w-full max-w-md border border-neutral-800 bg-neutral-950 p-8">
+      <h1 class="font-display text-4xl tracking-widest">KURACO ADMIN</h1>
+      <p class="mt-1 text-xs tracking-widest text-neutral-400 uppercase">RESTRICTED ACCESS</p>
+
+      <form id="login-form" class="mt-6 space-y-4">
+        <div>
+          <label class="block text-xs font-bold tracking-widest text-neutral-300 uppercase">EMAIL</label>
+          <input name="email" type="email" required class="mt-1 w-full border border-neutral-700 bg-black px-3 py-2.5 text-sm text-white" />
+        </div>
+        <div>
+          <label class="block text-xs font-bold tracking-widest text-neutral-300 uppercase">PASSWORD</label>
+          <input name="password" type="password" required class="mt-1 w-full border border-neutral-700 bg-black px-3 py-2.5 text-sm text-white" />
+        </div>
+        <p id="err" class="hidden text-xs font-semibold text-red-400"></p>
+        <button type="submit" class="w-full bg-white py-3.5 font-display text-xl tracking-widest text-black hover:bg-neutral-200">
+          SIGN IN
+        </button>
+      </form>
+    </div>
+
+    <script>
+      document.getElementById('login-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const body = Object.fromEntries(new FormData(e.target as HTMLFormElement).entries());
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const err = document.getElementById('err')!;
+          err.textContent = data.error;
+          err.classList.remove('hidden');
+          return;
+        }
+        window.location.href = '/kuracoadmin10';
+      });
+    </script>
+  </body>
+            </html>
+  ---
+import AdminLayout from '../../components/admin/AdminLayout.astro';
+import { ShoppingBag, IndianRupee, Users, AlertTriangle } from 'lucide-react';
+
+const db = Astro.locals.runtime.env.DB;
+
+const ordersCount = await db.prepare('SELECT COUNT(*) as c FROM orders').first<{ c: number }>();
+const revenueRow = await db.prepare("SELECT COALESCE(SUM(total), 0) as rev FROM orders WHERE status != 'Cancelled'").first<{ rev: number }>();
+const customersCount = await db.prepare('SELECT COUNT(*) as c FROM customers').first<{ c: number }>();
+const { results: lowStockProducts } = await db
+  .prepare('SELECT id, name, stock FROM products WHERE stock <= 5 ORDER BY stock ASC')
+  .all<any>();
+---
+
+<AdminLayout title="Dashboard">
+  <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+    <div class="border border-kuraco-border bg-white p-6">
+      <div class="flex items-center justify-between text-kuraco-muted">
+        <span class="text-xs font-bold tracking-widest uppercase">TOTAL ORDERS</span>
+        <ShoppingBag className="h-4 w-4" />
+      </div>
+      <p class="mt-3 font-display text-4xl">{ordersCount?.c ?? 0}</p>
+    </div>
+
+    <div class="border border-kuraco-border bg-white p-6">
+      <div class="flex items-center justify-between text-kuraco-muted">
+        <span class="text-xs font-bold tracking-widest uppercase">TOTAL REVENUE</span>
+        <IndianRupee className="h-4 w-4" />
+      </div>
+      <p class="mt-3 font-display text-4xl">Rs {(revenueRow?.rev ?? 0).toLocaleString()}</p>
+    </div>
+
+    <div class="border border-kuraco-border bg-white p-6">
+      <div class="flex items-center justify-between text-kuraco-muted">
+        <span class="text-xs font-bold tracking-widest uppercase">TOTAL CUSTOMERS</span>
+        <Users className="h-4 w-4" />
+      </div>
+      <p class="mt-3 font-display text-4xl">{customersCount?.c ?? 0}</p>
+    </div>
+
+    <div class="border border-kuraco-border bg-white p-6">
+      <div class="flex items-center justify-between text-red-600">
+        <span class="text-xs font-bold tracking-widest uppercase">LOW STOCK ALERT</span>
+        <AlertTriangle className="h-4 w-4" />
+      </div>
+      <p class="mt-3 font-display text-4xl">{lowStockProducts.length}</p>
+    </div>
+  </div>
+
+  {lowStockProducts.length > 0 && (
+    <div class="mt-8 border border-kuraco-black bg-white p-6">
+      <h2 class="font-display text-2xl tracking-wide">LOW STOCK ITEMS (&le; 5 UNITS)</h2>
+      <div class="mt-4 divide-y divide-kuraco-border">
+        {lowStockProducts.map((p) => (
+          <div class="flex items-center justify-between py-2.5 text-sm">
+            <span>{p.name}</span>
+            <span class="font-bold text-red-600">{p.stock} left</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )}
+    </AdminLayout>
+      import type { APIRoute } from 'astro';
+
+export const POST: APIRoute = async ({ request, locals }) => {
+  const db = locals.runtime.env.DB;
+  const { look_name, model_image_url, shirt_product_id, pant_product_id, shoes_product_id, full_look_price, sort_order } =
+    await request.json();
+
+  if (!look_name || !model_image_url || !shirt_product_id || !pant_product_id || !shoes_product_id || !full_look_price) {
+    return new Response(JSON.stringify({ error: 'All fields including Model Photo and all 3 products are required.' }), { status: 400 });
+  }
+
+  await db
+    .prepare(
+      `INSERT INTO runway_looks (look_name, model_image_url, shirt_product_id, pant_product_id, shoes_product_id, full_look_price, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(look_name, model_image_url, Number(shirt_product_id), Number(pant_product_id), Number(shoes_product_id), Number(full_look_price), Number(sort_order || 0))
+    .run();
+
+  return new Response(JSON.stringify({ ok: true }), { status: 201 });
+};
+
+export const PATCH: APIRoute = async ({ request, locals }) => {
+  const db = locals.runtime.env.DB;
+  const { id, is_active, sort_order } = await request.json();
+
+  if (typeof is_active === 'number') {
+    await db.prepare('UPDATE runway_looks SET is_active = ? WHERE id = ?').bind(is_active, id).run();
+  }
+  if (typeof sort_order === 'number') {
+    await db.prepare('UPDATE runway_looks SET sort_order = ? WHERE id = ?').bind(sort_order, id).run();
+  }
+  return new Response(JSON.stringify({ ok: true }), { status: 200 });
+};
+
+export const DELETE: APIRoute = async ({ request, locals }) => {
+  const db = locals.runtime.env.DB;
+  const { id } = await request.json();
+  await db.prepare('DELETE FROM runway_looks WHERE id = ?').bind(id).run();
+  return new Response(JSON.stringify({ ok: true }), { status: 200 });
+};
+    ---
+import AdminLayout from '../../components/admin/AdminLayout.astro';
+
+const db = Astro.locals.runtime.env.DB;
+const { results: products } = await db.prepare('SELECT id, name, price, category FROM products ORDER BY name ASC').all<any>();
+const { results: looks } = await db
+  .prepare(
+    `SELECT r.*, s.name as shirt_name, p.name as pant_name, sh.name as shoes_name
+     FROM runway_looks r
+     LEFT JOIN products s ON r.shirt_product_id = s.id
+     LEFT JOIN products p ON r.pant_product_id = p.id
+     LEFT JOIN products sh ON r.shoes_product_id = sh.id
+     ORDER BY r.sort_order ASC, r.id ASC`
+  )
+  .all<any>();
+---
+
+<AdminLayout title="Runway — Shop The Look">
+  <div class="grid grid-cols-1 gap-8 lg:grid-cols-12">
+    {/* Create New LOOK */}
+    <form id="new-look-form" class="space-y-4 border border-kuraco-border bg-white p-6 lg:col-span-5">
+      <h2 class="font-display text-2xl tracking-wide">CREATE NEW RUNWAY LOOK</h2>
+
+      <div>
+        <label class="block text-xs font-bold uppercase">LOOK NAME (E.G. LOOK 01 - STREET NIGHT)</label>
+        <input name="look_name" required class="mt-1 w-full border border-kuraco-border px-3 py-2 text-sm" />
+      </div>
+
+      <div>
+        <label class="block text-xs font-bold uppercase">MODEL PHOTO (UPLOAD TO R2)</label>
+        <input id="model-file" type="file" accept="image/*" required class="mt-1 w-full text-xs" />
+        <input type="hidden" name="model_image_url" id="model-image-url" />
+      </div>
+
+      <div>
+        <label class="block text-xs font-bold uppercase">1. SELECT SHIRT</label>
+        <select name="shirt_product_id" required class="mt-1 w-full border border-kuraco-border px-3 py-2 text-sm">
+          <option value="">-- Choose Shirt --</option>
+          {products.map((p) => (
+            <option value={p.id}>{p.name} (Rs {p.price})</option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <label class="block text-xs font-bold uppercase">2. SELECT PANT</label>
+        <select name="pant_product_id" required class="mt-1 w-full border border-kuraco-border px-3 py-2 text-sm">
+          <option value="">-- Choose Pant --</option>
+          {products.map((p) => (
+            <option value={p.id}>{p.name} (Rs {p.price})</option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <label class="block text-xs font-bold uppercase">3. SELECT SHOES</label>
+        <select name="shoes_product_id" required class="mt-1 w-full border border-kuraco-border px-3 py-2 text-sm">
+          <option value="">-- Choose Shoes --</option>
+          {products.map((p) => (
+            <option value={p.id}>{p.name} (Rs {p.price})</option>
+          ))}
+        </select>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-bold uppercase">FULL LOOK PRICE (RS)</label>
+          <input name="full_look_price" type="number" required class="mt-1 w-full border border-kuraco-border px-3 py-2 text-sm" />
+        </div>
+        <div>
+          <label class="block text-xs font-bold uppercase">DISPLAY ORDER</label>
+          <input name="sort_order" type="number" value="0" class="mt-1 w-full border border-kuraco-border px-3 py-2 text-sm" />
+        </div>
+      </div>
+
+      <button type="submit" class="w-full bg-kuraco-black py-3 font-display text-xl tracking-widest text-white">
+        PUBLISH RUNWAY LOOK
+      </button>
+    </form>
+
+    {/* Existing LOOKS List */}
+    <div class="space-y-4 lg:col-span-7">
+      {looks.map((look) => (
+        <div class="flex flex-col justify-between gap-4 border border-kuraco-border bg-white p-4 sm:flex-row sm:items-center">
+          <div class="flex items-center gap-4">
+            <img src={look.model_image_url} alt={look.look_name} class="h-24 w-16 object-cover" />
+            <div>
+              <h3 class="font-display text-xl">{look.look_name}</h3>
+              <p class="text-xs text-kuraco-muted">
+                1. {look.shirt_name} · 2. {look.pant_name} · 3. {look.shoes_name}
+              </p>
+              <p class="mt-1 text-xs font-bold">Full Look Price: Rs {look.full_look_price.toLocaleString()} · Order #{look.sort_order}</p>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <button
+              data-id={look.id}
+              data-active={look.is_active ? 0 : 1}
+              class="toggle-look border border-kuraco-black px-3 py-1.5 text-xs font-bold uppercase"
+            >
+              {look.is_active ? 'ON' : 'OFF'}
+            </button>
+            <button
+              data-id={look.id}
+              class="delete-look bg-red-600 px-3 py-1.5 text-xs font-bold text-white uppercase"
+            >
+              DELETE
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('new-look-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const form = e.target as HTMLFormElement;
+      const fileInput = document.getElementById('model-file') as HTMLInputElement;
+      if (fileInput.files?.[0]) {
+        const fd = new FormData();
+        fd.append('file', fileInput.files[0]);
+        const up = await fetch('/api/admin/upload', { method: 'POST', body: fd });
+        const { url } = await up.json();
+        (document.getElementById('model-image-url') as HTMLInputElement).value = url;
+      }
+
+      const payload = Object.fromEntries(new FormData(form).entries());
+      const res = await fetch('/api/admin/runway', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) window.location.reload();
+    });
+
+    document.querySelectorAll('.toggle-look').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        await fetch('/api/admin/runway', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: Number(btn.getAttribute('data-id')),
+            is_active: Number(btn.getAttribute('data-active')),
+          }),
+        });
+        window.location.reload();
+      });
+    });
+
+    document.querySelectorAll('.delete-look').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Delete this Runway Look?')) return;
+        await fetch('/api/admin/runway', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: Number(btn.getAttribute('data-id')) }),
+        });
+        window.location.reload();
+      });
+    });
+  </script>
+    </AdminLayout>
+        import type { APIRoute } from 'astro';
+
+export const POST: APIRoute = async ({ request, locals }) => {
+  const db = locals.runtime.env.DB;
+  const { name, price, old_price, category, sizes, images, stock, description, is_featured } = await request.json();
+  const slug = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now().toString().slice(-4)}`;
+
+  await db
+    .prepare(
+      `INSERT INTO products (slug, name, price, old_price, category, sizes, images, stock, description, is_featured)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      slug,
+      name,
+      Number(price),
+      old_price ? Number(old_price) : null,
+      category,
+      JSON.stringify(sizes || ['S', 'M', 'L', 'XL']),
+      JSON.stringify(images || []),
+      Number(stock || 0),
+      description || '',
+      is_featured ? 1 : 0
+    )
+    .run();
+
+  return new Response(JSON.stringify({ ok: true }), { status: 201 });
+};
+
+export const PATCH: APIRoute = async ({ request, locals }) => {
+  const db = locals.runtime.env.DB;
+  const body = await request.json();
+
+  if (typeof body.is_active === 'number' && Object.keys(body).length === 2) {
+    await db.prepare('UPDATE products SET is_active = ? WHERE id = ?').bind(body.is_active, body.id).run();
+    return new Response(JSON.stringify({ ok: true }));
+  }
+
+  await db
+    .prepare(
+      `UPDATE products SET name = ?, price = ?, old_price = ?, category = ?, sizes = ?, stock = ?, description = ?, is_featured = ? WHERE id = ?`
+    )
+    .bind(
+      body.name,
+      Number(body.price),
+      body.old_price ? Number(body.old_price) : null,
+      body.category,
+      JSON.stringify(body.sizes),
+      Number(body.stock),
+      body.description,
+      body.is_featured ? 1 : 0,
+      body.id
+    )
+    .run();
+
+  return new Response(JSON.stringify({ ok: true }));
+};
+
+export const DELETE: APIRoute = async ({ request, locals }) => {
+  const db = locals.runtime.env.DB;
+  const { id } = await request.json();
+  await db.prepare('DELETE FROM products WHERE id = ?').bind(id).run();
+  return new Response(JSON.stringify({ ok: true }));
+};
+    // src/pages/api/admin/orders.ts
+import type { APIRoute } from 'astro';
+
+export const GET: APIRoute = async ({ url, locals }) => {
+  const db = locals.runtime.env.DB;
+  const phone = url.searchParams.get('phone')?.trim();
+  const stmt = phone
+    ? db.prepare('SELECT * FROM orders WHERE customer_phone LIKE ? ORDER BY created_at DESC').bind(`%${phone}%`)
+    : db.prepare('SELECT * FROM orders ORDER BY created_at DESC LIMIT 100');
+  const { results } = await stmt.all();
+  return new Response(JSON.stringify({ orders: results }));
+};
+
+export const PATCH: APIRoute = async ({ request, locals }) => {
+  const db = locals.runtime.env.DB;
+  const { id, status } = await request.json();
+  const allowed = ['New', 'Packed', 'Shipped', 'Delivered', 'Cancelled'];
+  if (!allowed.includes(status)) return new Response(JSON.stringify({ error: 'Invalid status' }), { status: 400 });
+
+  await db.prepare('UPDATE orders SET status = ? WHERE id = ?').bind(status, id).run();
+  return new Response(JSON.stringify({ ok: true }));
+};
+    // src/pages/api/admin/customers.ts
+import type { APIRoute } from 'astro';
+
+export const PATCH: APIRoute = async ({ request, locals }) => {
+  const db = locals.runtime.env.DB;
+  const { id, is_blocked } = await request.json();
+  await db.prepare('UPDATE customers SET is_blocked = ? WHERE id = ?').bind(is_blocked ? 1 : 0, id).run();
+  return new Response(JSON.stringify({ ok: true }));
+};
+                                               
